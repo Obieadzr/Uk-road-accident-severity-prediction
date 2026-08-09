@@ -9,15 +9,24 @@ model = joblib.load('Models/xgb_model.pkl')
 scaler = joblib.load('Models/scaler.pkl')
 feature_columns = joblib.load('Models/feature_columns.pkl')
 
-THRESHOLD = 0.0091  # chosen for Fatal-class recall ~0.60 (see project writeup)
+# ── Cascaded decision thresholds ─────────────────────────────────────────
+# Stage 1: Fatal vs (Serious/Slight) — tuned for Fatal-class recall ~0.60
+THRESHOLD_FATAL = 0.0255
+# Stage 2: within non-Fatal cases, Serious vs Slight — tuned for Serious-class
+# recall ~0.40 within that subset. Without this second threshold, Serious was
+# almost never predicted (recall ~0.01) because Slight dominates 77% of the
+# data and wins plain argmax nearly every time. This stage exists to fix that.
+THRESHOLD_SERIOUS = 0.2407
 
 st.set_page_config(page_title="UK Road Accident Severity Predictor", layout="centered")
 st.title("UK Road Accident Severity Predictor")
 st.caption(
     "Portfolio demo — predicts accident severity (Fatal / Serious / Slight) from "
-    "UK collision-report-style inputs. Model is tuned to prioritize catching Fatal "
-    "cases (recall ≈ 0.60) at the cost of more false alarms — see README for the "
-    "full precision/recall tradeoff and limitations."
+    "UK collision-report-style inputs. Uses a two-stage tuned threshold to counter "
+    "severe class imbalance: Fatal is prioritized (recall ≈ 0.60), and Serious is "
+    "separately rescued from being crowded out by Slight (recall ≈ 0.29-0.40). "
+    "This comes at a real cost to Slight-class recall and overall accuracy — "
+    "see README for the full tradeoff and limitations."
 )
 
 st.divider()
@@ -138,22 +147,31 @@ if st.button("Predict severity", type="primary"):
     }
 
     X_input = pd.DataFrame([row])
-    # enforce exact column order the model was trained on
-    X_input = X_input[feature_columns]
+    # enforce exact column order the model was trained on — .copy() avoids
+    # any ambiguity about whether this is a view or a copy of the original
+    X_input = X_input[feature_columns].copy()
 
     # ── Replicate Step 5 scaling exactly (same columns, fitted scaler) ──
+    # .loc[:, cols] is the pandas-safe assignment pattern — avoids any risk
+    # of the transform silently not persisting (a known pandas gotcha with
+    # plain X_input[cols] = ... on a DataFrame derived from a column slice)
     cols_to_scale = ['longitude', 'latitude', 'speed_limit', 'number_of_vehicles',
                       'hour', 'month', 'number_of_casualties']
-    X_input[cols_to_scale] = scaler.transform(X_input[cols_to_scale])
+    X_input[cols_to_scale] = X_input[cols_to_scale].astype(float)
+    X_input.loc[:, cols_to_scale] = scaler.transform(X_input[cols_to_scale])
 
-    # ── Predict with thresholded Fatal decision ─────────────────────────
+    # ── Predict with cascaded thresholded decision ──────────────────────
     proba = model.predict_proba(X_input)[0]
     p_fatal, p_serious, p_slight = proba[0], proba[1], proba[2]
 
-    if p_fatal >= THRESHOLD:
+    if p_fatal >= THRESHOLD_FATAL:
         pred_label = "Fatal"
     else:
-        pred_label = "Serious" if p_serious >= p_slight else "Slight"
+        # Stage 2: normalize Serious vs Slight probability mass, apply its
+        # own tuned threshold instead of plain argmax (plain argmax almost
+        # always picks Slight since it's 77% of the data).
+        p_serious_norm = p_serious / (p_serious + p_slight)
+        pred_label = "Serious" if p_serious_norm >= THRESHOLD_SERIOUS else "Slight"
 
     st.divider()
     if pred_label == "Fatal":
@@ -170,7 +188,8 @@ if st.button("Predict severity", type="primary"):
         "Slight": f"{p_slight:.4f}",
     })
     st.caption(
-        f"Fatal is flagged if P(Fatal) ≥ {THRESHOLD} (a deliberately low bar, chosen "
-        "to catch more real fatal cases at the cost of more false alarms — see project "
-        "writeup for the precision/recall tradeoff)."
+        f"Fatal flagged if P(Fatal) ≥ {THRESHOLD_FATAL}. If not, Serious is flagged if "
+        f"its normalized probability (vs Slight) ≥ {THRESHOLD_SERIOUS}. Both thresholds "
+        "were tuned to counter class imbalance rather than using default argmax — see "
+        "README for the full precision/recall tradeoffs this creates."
     )
